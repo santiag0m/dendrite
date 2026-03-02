@@ -89,6 +89,17 @@ func CreateClient(
 	)
 }
 
+// CreateClientHTTP creates a plain *http.Client that routes requests
+// through the Pinecone network. Used for non-federation P2P requests
+// like relay discovery.
+func CreateClientHTTP(
+	s *pineconeSessions.Sessions,
+) *http.Client {
+	return &http.Client{
+		Transport: createTransport(s),
+	}
+}
+
 func CreateFederationClient(
 	cfg *config.Dendrite, s *pineconeSessions.Sessions,
 ) fclient.FederationClient {

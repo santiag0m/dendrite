@@ -57,15 +57,17 @@ import (
 const SessionProtocol = "matrix"
 
 type P2PMonolith struct {
-	Sessions       *pineconeSessions.Sessions
-	Multicast      *pineconeMulticast.Multicast
-	ConnManager    *pineconeConnections.ConnectionManager
-	Router         *pineconeRouter.Router
-	EventChannel   chan pineconeEvents.Event
-	RelayRetriever relay.RelayServerRetriever
-	ProcessCtx     *process.ProcessContext
+	Sessions        *pineconeSessions.Sessions
+	Multicast       *pineconeMulticast.Multicast
+	ConnManager     *pineconeConnections.ConnectionManager
+	Router          *pineconeRouter.Router
+	EventChannel    chan pineconeEvents.Event
+	RelayRetriever  relay.RelayServerRetriever
+	RelayDiscovery  *relay.RelayServerDiscovery
+	ProcessCtx      *process.ProcessContext
 
 	dendrite           setup.Monolith
+	relayingEnabled    bool
 	port               int
 	httpMux            *mux.Router
 	pineconeMux        *mux.Router
@@ -159,6 +161,7 @@ func (p *P2PMonolith) SetupDendrite(
 		UserAPI:                userAPI,
 	}
 	relayAPI := relayapi.NewRelayInternalAPI(cfg, cm, federation, rsAPI, keyRing, producer, enableRelaying, caches)
+	p.relayingEnabled = enableRelaying
 	logrus.Infof("Relaying enabled: %v", relayAPI.RelayingEnabled())
 
 	p.dendrite = setup.Monolith{
@@ -285,17 +288,24 @@ func (p *P2PMonolith) setupHttpServers(userProvider *users.PineconeUserProvider,
 
 	p.pineconeMux = mux.NewRouter().SkipClean(true).UseEncodedPath()
 	p.pineconeMux.PathPrefix(users.PublicURL).HandlerFunc(userProvider.FederatedUserProfiles)
+	p.pineconeMux.HandleFunc(relay.RelayInfoPath, p.handleRelayInfo).Methods(http.MethodGet)
 	p.pineconeMux.PathPrefix(httputil.PublicFederationPathPrefix).Handler(routers.Federation)
 	p.pineconeMux.PathPrefix(httputil.PublicMediaPathPrefix).Handler(routers.Media)
 
 	pHTTP := p.Sessions.Protocol(SessionProtocol).HTTP()
 	pHTTP.Mux().Handle(users.PublicURL, p.pineconeMux)
+	pHTTP.Mux().Handle(relay.RelayInfoPath, p.pineconeMux)
 	pHTTP.Mux().Handle(httputil.PublicFederationPathPrefix, p.pineconeMux)
 	pHTTP.Mux().Handle(httputil.PublicMediaPathPrefix, p.pineconeMux)
 }
 
 type relayServersRequest struct {
 	RelayServers []spec.ServerName `json:"relay_servers"`
+}
+
+func (p *P2PMonolith) handleRelayInfo(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(relay.RelayInfoResponse{Relaying: p.relayingEnabled})
 }
 
 func (p *P2PMonolith) handleRelayServers(w http.ResponseWriter, r *http.Request) {
@@ -374,6 +384,10 @@ func (p *P2PMonolith) startEventHandler() {
 	)
 	p.RelayRetriever.InitializeRelayServers(eLog)
 
+	// Set up relay discovery: query new peers to see if they're relays.
+	discoveryClient := conn.CreateClientHTTP(p.Sessions)
+	p.RelayDiscovery = relay.NewRelayServerDiscovery(discoveryClient, &p.RelayRetriever)
+
 	go func(ch <-chan pineconeEvents.Event) {
 		for {
 			select {
@@ -381,6 +395,7 @@ func (p *P2PMonolith) startEventHandler() {
 				switch e := event.(type) {
 				case pineconeEvents.PeerAdded:
 					p.RelayRetriever.StartSync()
+					p.RelayDiscovery.OnPeerDiscovered(e.PeerID)
 				case pineconeEvents.PeerRemoved:
 					if p.RelayRetriever.IsRunning() && p.Router.TotalPeerCount() == 0 {
 						// NOTE: Don't block on channel
@@ -399,6 +414,7 @@ func (p *P2PMonolith) startEventHandler() {
 					if err := p.dendrite.FederationAPI.PerformWakeupServers(p.ProcessCtx.Context(), req, res); err != nil {
 						eLog.WithError(err).Error("Failed to wakeup destination", e.PeerID)
 					}
+					p.RelayDiscovery.OnPeerDiscovered(e.PeerID)
 				}
 			case <-p.stopHandlingEvents:
 				logrus.Info("Stopping processing pinecone events")
