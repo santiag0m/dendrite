@@ -141,6 +141,39 @@ Dendrite, but directly advance P2P readiness.
 
 ---
 
+## Tier 4 — Infrastructure & CI Improvements
+
+### 10. Re-enable WASM Build in CI
+
+**Status:** The WASM build job in `.github/workflows/dendrite.yml` is currently
+**disabled** (`if: ${{ false }}`). All storage packages have WASM stubs
+(SQLite-only), and fulltext search is a no-op stub in WASM
+(`internal/fulltext/bleve_wasm.go`). Re-enabling and fixing the WASM build
+pipeline ensures the embedded browser use case doesn't regress.
+
+### 11. Add P2P-Specific CI Tests
+
+There are **zero automated tests** for the Pinecone or Yggdrasil demo entry
+points. The relay retriever (`cmd/dendrite-demo-pinecone/relay/retriever.go`)
+has a known gap: line 169 asks "What happens if your relay receives new messages
+after this point?" Adding CI that spins up multiple Pinecone nodes and tests
+relay delivery end-to-end would be high value.
+
+### 12. Relay Server Auto-Discovery
+
+Currently relay servers must be **manually configured** in the database. There
+is no auto-discovery mechanism. Implementing relay advertisement (perhaps via
+room state or a well-known endpoint) would significantly improve the P2P
+developer/user experience.
+
+### 13. Update Outdated P2P Documentation
+
+`docs/other/p2p.md` dates from May 2020 and references a hardcoded libp2p
+websocket relay (`TODO` on line 35) and a missing Docker image (`TODO` on
+line 74). The Tor and I2P demo docs in `contrib/` are also minimal stubs.
+
+---
+
 ## Recommended Starting Point
 
 For maximum impact with moderate effort, start with **Tier 1, Item 2** (Federation
