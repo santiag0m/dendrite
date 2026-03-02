@@ -46,7 +46,7 @@ func (r *RelayInternalAPI) PerformRelayServerSync(
 		logrus.Errorf("P2PGetTransactionFromRelay: %s", err.Error())
 		return err
 	}
-	r.processTransaction(&asyncResponse.Transaction)
+	r.processTransaction(ctx, &asyncResponse.Transaction)
 
 	prevEntry = fclient.RelayEntry{EntryID: asyncResponse.EntryID}
 	for asyncResponse.EntriesQueued {
@@ -58,7 +58,7 @@ func (r *RelayInternalAPI) PerformRelayServerSync(
 			logrus.Errorf("P2PGetTransactionFromRelay: %s", err.Error())
 			return err
 		}
-		r.processTransaction(&asyncResponse.Transaction)
+		r.processTransaction(ctx, &asyncResponse.Transaction)
 	}
 
 	return nil
@@ -128,7 +128,7 @@ func (r *RelayInternalAPI) QueryTransactions(
 	return response, nil
 }
 
-func (r *RelayInternalAPI) processTransaction(txn *gomatrixserverlib.Transaction) {
+func (r *RelayInternalAPI) processTransaction(ctx context.Context, txn *gomatrixserverlib.Transaction) {
 	logrus.Warn("Processing transaction from relay server")
 	mu := internal.NewMutexByRoom()
 	t := internal.NewTxnReq(
@@ -145,5 +145,5 @@ func (r *RelayInternalAPI) processTransaction(txn *gomatrixserverlib.Transaction
 		txn.TransactionID,
 		txn.Destination)
 
-	t.ProcessTransaction(context.TODO())
+	t.ProcessTransaction(ctx)
 }

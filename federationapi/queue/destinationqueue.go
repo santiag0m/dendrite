@@ -135,7 +135,9 @@ func (oq *destinationQueue) handleBackoffNotifier() {
 
 // wakeQueueIfEventsPending calls wakeQueueAndNotify only if there are
 // pending events or if forceWakeup is true. This prevents starting the
-// queue unnecessarily.
+// queue unnecessarily. Also wakes up if the queue has overflowed,
+// indicating events in the database that need delivery (e.g., events
+// retained after relay delivery that should be delivered directly).
 func (oq *destinationQueue) wakeQueueIfEventsPending(forceWakeup bool) {
 	eventsPending := func() bool {
 		oq.pendingMutex.Lock()
@@ -143,11 +145,8 @@ func (oq *destinationQueue) wakeQueueIfEventsPending(forceWakeup bool) {
 		return len(oq.pendingPDUs) > 0 || len(oq.pendingEDUs) > 0
 	}
 
-	// NOTE : Only wakeup and notify the queue if there are pending events
-	// or if forceWakeup is true. Otherwise there is no reason to start the
-	// queue goroutine and waste resources.
-	if forceWakeup || eventsPending() {
-		logrus.Debugf("Starting queue %q -> %q due to pending events or forceWakeup", oq.origin, oq.destination)
+	if forceWakeup || eventsPending() || oq.overflowed.Load() {
+		logrus.Debugf("Starting queue %q -> %q due to pending events, overflowed DB entries, or forceWakeup", oq.origin, oq.destination)
 		oq.wakeQueueAndNotify()
 	}
 }
@@ -385,6 +384,22 @@ func (oq *destinationQueue) backgroundSend() {
 			}
 		} else {
 			oq.handleTransactionSuccess(pduCount, eduCount, sendMethod)
+			if sendMethod == statistics.SendViaRelay {
+				// After relay delivery, stop the queue goroutine. Events are
+				// retained in the DB for direct delivery later. The goroutine
+				// will restart when the destination comes back online (via
+				// RetryServer) or when new events arrive. This prevents an
+				// infinite relay re-send loop.
+				//
+				// Clear overflowed and drain any pending notification so that
+				// checkNotificationsOnClose does not immediately restart us.
+				oq.overflowed.Store(false)
+				select {
+				case <-oq.notify:
+				default:
+				}
+				return
+			}
 		}
 	}
 }
@@ -420,8 +435,12 @@ func (oq *destinationQueue) nextTransaction(
 			sendMethod = statistics.SendViaRelay
 			relaySuccess := false
 			logrus.Infof("Sending %q to relay servers: %v", t.TransactionID, relayServers)
-			// TODO : how to pass through actual userID here?!?!?!?!
-			userID, userErr := spec.NewUserID("@user:"+string(oq.destination), false)
+
+			// Construct a userID for the relay protocol. The relay stores transactions
+			// keyed by userID.Domain(), so the local part is not significant for routing.
+			// We try to extract a real user from the PDUs for better spec compliance,
+			// falling back to a well-known convention that matches the relay retriever.
+			userID, userErr := destinationUserID(oq.destination, t.PDUs)
 			if userErr != nil {
 				return userErr, sendMethod
 			}
@@ -432,15 +451,7 @@ func (oq *destinationQueue) nextTransaction(
 				if relayErr != nil {
 					err = relayErr
 				} else {
-					// If sending to one of the relay servers succeeds, consider the send successful.
 					relaySuccess = true
-
-					// TODO : what about if the dest comes back online but can't see their relay?
-					// How do I sync with the dest in that case?
-					// Should change the database to have a "relay success" flag on events and if
-					// I see the node back online, maybe directly send through the backlog of events
-					// with "relay success"... could lead to duplicate events, but only those that
-					// I sent. And will lead to a much more consistent experience.
 				}
 			}
 
@@ -452,18 +463,26 @@ func (oq *destinationQueue) nextTransaction(
 	}
 	switch errResponse := err.(type) {
 	case nil:
-		// Clean up the transaction in the database.
-		if pduReceipts != nil {
-			//logrus.Infof("Cleaning PDUs %q", pduReceipt.String())
-			if err = oq.db.CleanPDUs(oq.process.Context(), oq.destination, pduReceipts); err != nil {
-				logrus.WithError(err).Errorf("Failed to clean PDUs for server %q", t.Destination)
+		// Only clean events from the database on direct delivery success.
+		// When delivered via relay, we retain the events in the database so that
+		// they can be delivered directly if/when the destination comes back online.
+		// This prevents message loss when the destination cannot reach its relay.
+		// The events will be cleaned up on the next successful direct delivery,
+		// which is triggered by RetryServer/MarkServerAlive when the destination
+		// is seen online again.
+		if sendMethod == statistics.SendDirect {
+			if pduReceipts != nil {
+				if err = oq.db.CleanPDUs(oq.process.Context(), oq.destination, pduReceipts); err != nil {
+					logrus.WithError(err).Errorf("Failed to clean PDUs for server %q", t.Destination)
+				}
 			}
-		}
-		if eduReceipts != nil {
-			//logrus.Infof("Cleaning EDUs %q", eduReceipt.String())
-			if err = oq.db.CleanEDUs(oq.process.Context(), oq.destination, eduReceipts); err != nil {
-				logrus.WithError(err).Errorf("Failed to clean EDUs for server %q", t.Destination)
+			if eduReceipts != nil {
+				if err = oq.db.CleanEDUs(oq.process.Context(), oq.destination, eduReceipts); err != nil {
+					logrus.WithError(err).Errorf("Failed to clean EDUs for server %q", t.Destination)
+				}
 			}
+		} else {
+			logrus.Infof("Relay delivery succeeded for %q; retaining events in DB for direct delivery retry", t.Destination)
 		}
 		// Reset the transaction ID.
 		oq.transactionIDMutex.Lock()
@@ -595,4 +614,33 @@ func (oq *destinationQueue) handleTransactionSuccess(pduCount int, eduCount int,
 		default:
 		}
 	}
+}
+
+// destinationUserID extracts a user ID belonging to the destination server
+// from the transaction's PDUs (e.g. from membership event state keys).
+// If no matching user is found, falls back to the well-known @user:<dest>
+// convention. The relay protocol keys storage by userID.Domain(), so only
+// the domain matters for routing; this convention is consistent with the
+// relay retriever side.
+func destinationUserID(destination spec.ServerName, pdus []json.RawMessage) (*spec.UserID, error) {
+	for _, pdu := range pdus {
+		var ev struct {
+			Type     string  `json:"type"`
+			StateKey *string `json:"state_key"`
+		}
+		if err := json.Unmarshal(pdu, &ev); err != nil {
+			continue
+		}
+		if ev.Type == spec.MRoomMember && ev.StateKey != nil {
+			_, domain, err := gomatrixserverlib.SplitID('@', *ev.StateKey)
+			if err != nil {
+				continue
+			}
+			if spec.ServerName(domain) == destination {
+				return spec.NewUserID(*ev.StateKey, false)
+			}
+		}
+	}
+	// Fallback: use a well-known convention matching the relay retriever.
+	return spec.NewUserID("@user:"+string(destination), false)
 }

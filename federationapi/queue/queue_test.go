@@ -887,7 +887,7 @@ func TestSendEDUMultipleFailuresAssumedOffline(t *testing.T) {
 	poll.WaitOn(t, check, poll.WithTimeout(5*time.Second), poll.WithDelay(100*time.Millisecond))
 }
 
-func TestSendPDUOnRelaySuccessRemovedFromDB(t *testing.T) {
+func TestSendPDUOnRelaySuccessRetainedInDB(t *testing.T) {
 	t.Parallel()
 	failuresUntilBlacklist := uint32(16)
 	failuresUntilAssumedOffline := uint32(1)
@@ -906,27 +906,42 @@ func TestSendPDUOnRelaySuccessRemovedFromDB(t *testing.T) {
 	err := queues.SendEvent(ev, "localhost", []spec.ServerName{destination})
 	assert.NoError(t, err)
 
-	check := func(log poll.LogT) poll.Result {
-		if fc.txCount.Load() >= 1 {
-			if fc.txRelayCount.Load() == 1 {
-				data, dbErr := db.GetPendingPDUs(pc.Context(), destination, 100)
-				assert.NoError(t, dbErr)
-				if len(data) == 0 {
-					return poll.Success()
-				}
-				return poll.Continue("waiting for event to be removed from database. Currently present PDU: %d", len(data))
+	// After relay delivery, events should be retained in the DB for direct delivery retry.
+	checkRetained := func(log poll.LogT) poll.Result {
+		if fc.txCount.Load() >= 1 && fc.txRelayCount.Load() >= 1 {
+			data, dbErr := db.GetPendingPDUs(pc.Context(), destination, 100)
+			assert.NoError(t, dbErr)
+			if len(data) == 1 {
+				return poll.Success()
 			}
-			return poll.Continue("waiting for more relay send attempts before checking database. Currently %d", fc.txRelayCount.Load())
+			return poll.Continue("waiting for event to be retained in database after relay. Currently present PDU: %d", len(data))
 		}
-		return poll.Continue("waiting for more send attempts before checking database. Currently %d", fc.txCount.Load())
+		return poll.Continue("waiting for relay send attempt. Direct: %d, Relay: %d", fc.txCount.Load(), fc.txRelayCount.Load())
 	}
-	poll.WaitOn(t, check, poll.WithTimeout(5*time.Second), poll.WithDelay(100*time.Millisecond))
+	poll.WaitOn(t, checkRetained, poll.WithTimeout(5*time.Second), poll.WithDelay(100*time.Millisecond))
 
 	assumedOffline, _ := db.IsServerAssumedOffline(context.Background(), destination)
 	assert.Equal(t, true, assumedOffline)
+
+	// Now simulate the destination coming back online: direct send succeeds,
+	// which should clean the event from the DB.
+	fc.shouldTxSucceed = true
+	dest := queues.getQueue(destination)
+	wasBlacklisted := dest.statistics.MarkServerAlive()
+	queues.RetryServer(destination, wasBlacklisted)
+
+	checkCleaned := func(log poll.LogT) poll.Result {
+		data, dbErr := db.GetPendingPDUs(pc.Context(), destination, 100)
+		assert.NoError(t, dbErr)
+		if len(data) == 0 {
+			return poll.Success()
+		}
+		return poll.Continue("waiting for event to be removed from database after direct delivery. Currently present PDU: %d", len(data))
+	}
+	poll.WaitOn(t, checkCleaned, poll.WithTimeout(5*time.Second), poll.WithDelay(100*time.Millisecond))
 }
 
-func TestSendEDUOnRelaySuccessRemovedFromDB(t *testing.T) {
+func TestSendEDUOnRelaySuccessRetainedInDB(t *testing.T) {
 	t.Parallel()
 	failuresUntilBlacklist := uint32(16)
 	failuresUntilAssumedOffline := uint32(1)
@@ -945,22 +960,37 @@ func TestSendEDUOnRelaySuccessRemovedFromDB(t *testing.T) {
 	err := queues.SendEDU(ev, "localhost", []spec.ServerName{destination})
 	assert.NoError(t, err)
 
-	check := func(log poll.LogT) poll.Result {
-		if fc.txCount.Load() >= 1 {
-			if fc.txRelayCount.Load() == 1 {
-				data, dbErr := db.GetPendingEDUs(pc.Context(), destination, 100)
-				assert.NoError(t, dbErr)
-				if len(data) == 0 {
-					return poll.Success()
-				}
-				return poll.Continue("waiting for event to be removed from database. Currently present EDU: %d", len(data))
+	// After relay delivery, events should be retained in the DB for direct delivery retry.
+	checkRetained := func(log poll.LogT) poll.Result {
+		if fc.txCount.Load() >= 1 && fc.txRelayCount.Load() >= 1 {
+			data, dbErr := db.GetPendingEDUs(pc.Context(), destination, 100)
+			assert.NoError(t, dbErr)
+			if len(data) == 1 {
+				return poll.Success()
 			}
-			return poll.Continue("waiting for more relay send attempts before checking database. Currently %d", fc.txRelayCount.Load())
+			return poll.Continue("waiting for event to be retained in database after relay. Currently present EDU: %d", len(data))
 		}
-		return poll.Continue("waiting for more send attempts before checking database. Currently %d", fc.txCount.Load())
+		return poll.Continue("waiting for relay send attempt. Direct: %d, Relay: %d", fc.txCount.Load(), fc.txRelayCount.Load())
 	}
-	poll.WaitOn(t, check, poll.WithTimeout(5*time.Second), poll.WithDelay(100*time.Millisecond))
+	poll.WaitOn(t, checkRetained, poll.WithTimeout(5*time.Second), poll.WithDelay(100*time.Millisecond))
 
 	assumedOffline, _ := db.IsServerAssumedOffline(context.Background(), destination)
 	assert.Equal(t, true, assumedOffline)
+
+	// Now simulate the destination coming back online: direct send succeeds,
+	// which should clean the event from the DB.
+	fc.shouldTxSucceed = true
+	dest := queues.getQueue(destination)
+	wasBlacklisted := dest.statistics.MarkServerAlive()
+	queues.RetryServer(destination, wasBlacklisted)
+
+	checkCleaned := func(log poll.LogT) poll.Result {
+		data, dbErr := db.GetPendingEDUs(pc.Context(), destination, 100)
+		assert.NoError(t, dbErr)
+		if len(data) == 0 {
+			return poll.Success()
+		}
+		return poll.Continue("waiting for event to be removed from database after direct delivery. Currently present EDU: %d", len(data))
+	}
+	poll.WaitOn(t, checkCleaned, poll.WithTimeout(5*time.Second), poll.WithDelay(100*time.Millisecond))
 }

@@ -20,6 +20,9 @@ import (
 
 const (
 	relayServerRetryInterval = time.Second * 30
+	// After all relays are synced, periodically re-check them in case new
+	// messages arrived after the initial sync completed.
+	relaySyncedRecheckInterval = time.Minute * 5
 )
 
 type RelayServerRetriever struct {
@@ -121,22 +124,35 @@ func (r *RelayServerRetriever) SyncRelayServers(stop <-chan bool) {
 	t := time.NewTimer(relayServerRetryInterval)
 	for {
 		relayServersToQuery := []spec.ServerName{}
+		allSynced := true
 		func() {
 			r.queriedServersMutex.Lock()
 			defer r.queriedServersMutex.Unlock()
 			for server, complete := range r.relayServersQueried {
 				if !complete {
 					relayServersToQuery = append(relayServersToQuery, server)
+					allSynced = false
 				}
 			}
 		}()
-		if len(relayServersToQuery) == 0 {
-			// All relay servers have been synced.
-			logrus.Info("Finished syncing with all known relays")
-			return
+
+		if allSynced && len(relayServersToQuery) == 0 {
+			// All relay servers have been synced. Re-mark them as unsynced
+			// and re-check after a longer interval to catch messages that
+			// arrived at the relay after our initial sync completed.
+			logrus.Info("All relays synced; scheduling periodic re-check")
+			func() {
+				r.queriedServersMutex.Lock()
+				defer r.queriedServersMutex.Unlock()
+				for server := range r.relayServersQueried {
+					r.relayServersQueried[server] = false
+				}
+			}()
+			t.Reset(relaySyncedRecheckInterval)
+		} else {
+			r.queryRelayServers(relayServersToQuery)
+			t.Reset(relayServerRetryInterval)
 		}
-		r.queryRelayServers(relayServersToQuery)
-		t.Reset(relayServerRetryInterval)
 
 		select {
 		case <-stop:
@@ -166,12 +182,9 @@ func (r *RelayServerRetriever) queryRelayServers(relayServers []spec.ServerName)
 				defer r.queriedServersMutex.Unlock()
 				r.relayServersQueried[server] = true
 			}()
-			// TODO : What happens if your relay receives new messages after this point?
-			// Should you continue to check with them, or should they try and contact you?
-			// They could send a "new_async_events" message your way maybe?
-			// Then you could mark them as needing to be queried again.
-			// What if you miss this message?
-			// Maybe you should try querying them again after a certain period of time as a backup?
+			// NOTE: The relay may receive new messages after this sync completes.
+			// SyncRelayServers handles this by periodically re-marking all relays
+			// as unsynced and re-checking them after relaySyncedRecheckInterval.
 		} else {
 			logrus.Errorf("Failed querying relay server: %s", err.Error())
 		}

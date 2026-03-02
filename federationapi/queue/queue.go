@@ -339,6 +339,9 @@ func (oqs *OutgoingQueues) RetryServer(srv spec.ServerName, wasBlacklisted bool)
 	}
 
 	if queue := oqs.getQueue(srv); queue != nil {
+		// Mark as overflowed so the queue checks the database for any events
+		// retained from prior relay deliveries that should now be sent directly.
+		queue.overflowed.Store(true)
 		queue.wakeQueueIfEventsPending(wasBlacklisted)
 	}
 }

@@ -29,9 +29,9 @@ func (r *FederationInternalAPI) PerformDirectoryLookup(
 	request *api.PerformDirectoryLookupRequest,
 	response *api.PerformDirectoryLookupResponse,
 ) (err error) {
-	if !r.shouldAttemptDirectFederation(request.ServerName) {
-		return fmt.Errorf("relay servers have no meaningful response for directory lookup.")
-	}
+	// Directory lookups require a synchronous response. We attempt direct
+	// federation regardless of relay configuration since the destination may
+	// be reachable again.
 
 	dir, err := r.federation.LookupRoomAlias(
 		ctx,
@@ -143,9 +143,10 @@ func (r *FederationInternalAPI) performJoinUsingServer(
 	serverName spec.ServerName,
 	unsigned map[string]interface{},
 ) error {
-	if !r.shouldAttemptDirectFederation(serverName) {
-		return fmt.Errorf("relay servers have no meaningful response for join.")
-	}
+	// Joins require a synchronous make_join/send_join exchange which cannot
+	// be proxied through relays. However, the destination may have come back
+	// online since it was marked assumed-offline, so we always attempt
+	// direct federation for joins rather than skipping the server entirely.
 
 	user, err := spec.NewUserID(userID, true)
 	if err != nil {
@@ -324,9 +325,8 @@ func (r *FederationInternalAPI) performOutboundPeekUsingServer(
 	serverName spec.ServerName,
 	supportedVersions []gomatrixserverlib.RoomVersion,
 ) error {
-	if !r.shouldAttemptDirectFederation(serverName) {
-		return fmt.Errorf("relay servers have no meaningful response for outbound peek.")
-	}
+	// Peeks require a persistent connection which relays cannot proxy.
+	// Attempt direct federation anyway in case the destination is reachable.
 
 	// create a unique ID for this peek.
 	// for now we just use the room ID again. In future, if we ever
@@ -444,11 +444,10 @@ func (r *FederationInternalAPI) PerformLeave(
 
 	// Try each server that we were provided until we land on one that
 	// successfully completes the make-leave send-leave dance.
+	// Like joins, leaves require synchronous make_leave/send_leave and
+	// cannot be proxied through relays, but we still attempt direct
+	// federation because the destination may have come back online.
 	for _, serverName := range request.ServerNames {
-		if !r.shouldAttemptDirectFederation(serverName) {
-			continue
-		}
-
 		// Try to perform a make_leave using the information supplied in the
 		// request.
 		respMakeLeave, err := r.federation.MakeLeave(
@@ -562,11 +561,11 @@ func (r *FederationInternalAPI) SendInvite(
 		return nil, fmt.Errorf("gomatrixserverlib.SplitID: %w", err)
 	}
 
-	// TODO (devon): This should be allowed via a relay. Currently only transactions
-	// can be sent to relays. Would need to extend relays to handle invites.
-	if !r.shouldAttemptDirectFederation(destination) {
-		return nil, fmt.Errorf("relay servers have no meaningful response for invite.")
-	}
+	// Invites require a synchronous response (the signed invite event) which
+	// the relay protocol cannot provide. In the future, the relay protocol
+	// could be extended with an invite-specific endpoint. For now, we attempt
+	// direct federation regardless of relay configuration — the destination
+	// may have come back online since it was marked assumed-offline.
 
 	logrus.WithFields(logrus.Fields{
 		"event_id":     event.EventID(),
@@ -619,11 +618,9 @@ func (r *FederationInternalAPI) SendInviteV3(
 		return nil, err
 	}
 
-	// TODO (devon): This should be allowed via a relay. Currently only transactions
-	// can be sent to relays. Would need to extend relays to handle invites.
-	if !r.shouldAttemptDirectFederation(invitee.Domain()) {
-		return nil, fmt.Errorf("relay servers have no meaningful response for invite.")
-	}
+	// Invites require a synchronous response (the signed invite event) which
+	// the relay protocol cannot provide. We attempt direct federation regardless
+	// of relay configuration — the destination may have come back online.
 
 	logrus.WithFields(logrus.Fields{
 		"user_id":      invitee.String(),
@@ -835,14 +832,3 @@ func (r *FederationInternalAPI) P2PRemoveRelayServers(
 	return nil
 }
 
-func (r *FederationInternalAPI) shouldAttemptDirectFederation(
-	destination spec.ServerName,
-) bool {
-	var shouldRelay bool
-	stats := r.statistics.ForServer(destination)
-	if stats.AssumedOffline() && len(stats.KnownRelayServers()) > 0 {
-		shouldRelay = true
-	}
-
-	return !shouldRelay
-}
