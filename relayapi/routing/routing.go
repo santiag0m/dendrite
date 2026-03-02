@@ -78,6 +78,15 @@ func Setup(
 					JSON: spec.InvalidUsername("Username was invalid"),
 				}
 			}
+			// Only allow a server to retrieve transactions destined for its own domain.
+			// This prevents nodes from obtaining transactions not destined for them.
+			if userID.Domain() != request.Origin() {
+				logrus.Warnf("relay_txn: origin %s tried to fetch transactions for %s", request.Origin(), userID.String())
+				return util.JSONResponse{
+					Code: http.StatusForbidden,
+					JSON: spec.Forbidden("origin does not match the requested user's domain"),
+				}
+			}
 			return GetTransactionFromRelay(httpReq, request, relayAPI, *userID)
 		},
 	)).Methods(http.MethodGet, http.MethodOptions)

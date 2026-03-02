@@ -11,6 +11,7 @@ import (
 	"crypto/ed25519"
 	"crypto/tls"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -251,6 +252,8 @@ func (p *P2PMonolith) setupHttpServers(userProvider *users.PineconeUserProvider,
 	p.httpMux.PathPrefix(httputil.DendriteAdminPathPrefix).Handler(routers.DendriteAdmin)
 	p.httpMux.PathPrefix(httputil.SynapseAdminPathPrefix).Handler(routers.SynapseAdmin)
 
+	p.httpMux.HandleFunc("/_matrix/p2p/relay_servers", p.handleRelayServers).Methods(http.MethodGet, http.MethodPut)
+
 	if enableWebsockets {
 		wsUpgrader := websocket.Upgrader{
 			CheckOrigin: func(_ *http.Request) bool {
@@ -289,6 +292,31 @@ func (p *P2PMonolith) setupHttpServers(userProvider *users.PineconeUserProvider,
 	pHTTP.Mux().Handle(users.PublicURL, p.pineconeMux)
 	pHTTP.Mux().Handle(httputil.PublicFederationPathPrefix, p.pineconeMux)
 	pHTTP.Mux().Handle(httputil.PublicMediaPathPrefix, p.pineconeMux)
+}
+
+type relayServersRequest struct {
+	RelayServers []spec.ServerName `json:"relay_servers"`
+}
+
+func (p *P2PMonolith) handleRelayServers(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		relayServers := p.RelayRetriever.GetRelayServers()
+		resp := relayServersRequest{RelayServers: relayServers}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	case http.MethodPut:
+		var req relayServersRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON"})
+			return
+		}
+		p.RelayRetriever.SetRelayServers(req.RelayServers)
+		logrus.Infof("Relay servers updated via API: %v", req.RelayServers)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"relay_servers": req.RelayServers})
+	}
 }
 
 func (p *P2PMonolith) startHTTPServers() {

@@ -82,6 +82,25 @@ func createGetRelayTxnHTTPRequest(serverName spec.ServerName, userID string) *ht
 	return httpreq
 }
 
+// createGetRelayTxnHTTPRequestMatchingOrigin creates a relay_txn request where the
+// requesting server's origin matches the requested userID's domain, which is required
+// for the authentication check.
+func createGetRelayTxnHTTPRequestMatchingOrigin(serverName spec.ServerName) *http.Request {
+	_, sk, _ := ed25519.GenerateKey(nil)
+	keyID := signing.KeyID
+	pk := sk.Public().(ed25519.PublicKey)
+	origin := spec.ServerName(hex.EncodeToString(pk))
+	userID := "@user:" + string(origin)
+	req := fclient.NewFederationRequest("GET", origin, serverName, "/_matrix/federation/v1/relay_txn/"+userID)
+	content := fclient.RelayEntry{EntryID: 0}
+	req.SetContent(content)
+	req.Sign(origin, gomatrixserverlib.KeyID(keyID), sk)
+	httpreq, _ := req.HTTPRequest()
+	vars := map[string]string{"userID": userID}
+	httpreq = mux.SetURLVars(httpreq, vars)
+	return httpreq
+}
+
 type sendRelayContent struct {
 	PDUs []json.RawMessage       `json:"pdus"`
 	EDUs []gomatrixserverlib.EDU `json:"edus"`
@@ -129,8 +148,13 @@ func TestCreateRelayPublicRoutes(t *testing.T) {
 				wantCode: 400,
 			},
 			{
-				name:     "relay_txn valid user id",
+				name:     "relay_txn origin mismatch",
 				req:      createGetRelayTxnHTTPRequest(cfg.Global.ServerName, "@user:local"),
+				wantCode: 403,
+			},
+			{
+				name:     "relay_txn matching origin",
+				req:      createGetRelayTxnHTTPRequestMatchingOrigin(cfg.Global.ServerName),
 				wantCode: 200,
 			},
 			{

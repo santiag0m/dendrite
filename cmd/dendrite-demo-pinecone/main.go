@@ -91,7 +91,6 @@ func main() {
 	enableWebsockets := true
 	p2pMonolith.SetupDendrite(processCtx, cfg, cm, routers, *instancePort, *instanceRelayingEnabled, enableMetrics, enableWebsockets)
 	p2pMonolith.StartMonolith()
-	p2pMonolith.WaitForShutdown()
 
 	go func() {
 		listener, err := net.Listen("tcp", *instanceListen)
@@ -120,4 +119,6 @@ func main() {
 			fmt.Println("Inbound connection", conn.RemoteAddr(), "is connected to port", port)
 		}
 	}()
+
+	p2pMonolith.WaitForShutdown()
 }
